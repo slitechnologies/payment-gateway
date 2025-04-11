@@ -18,9 +18,9 @@ payment:
   gateway:
     base-url: https://pg.telpay.youcloudtech.com
     payment-page-base-url: https://pg.telpay.co.zw.youcloudtech.com/gateway-payments
-    client-id: 1750499f-8c97-414d-bdb6-612ce555742f
-    client-secret: fc2bf1b4-6855-459f-9e0c-a4de4219bd79
-    merchant-name: Tinotenda
+    client-id: ${PAYMENT_CLIENT_ID}
+    client-secret: ${PAYMENT_CLIENT_SECRET}
+    merchant-name: ${MERCHANT_NAME}
 
 feign:
   client:
@@ -28,37 +28,3 @@ feign:
       default:
         connectTimeout: 5000
         readTimeout: 5000
-
-
-
-
-
-
-
-
-
-#spring:
-#  application:
-#    name: payment-gateway
-#  cache:
-#    type: caffeine
-#    caffeine:
-#      spec: expireAfterWrite=1h
-#
-#server:
-#  port: 8090
-#
-#payment:
-#  gateway:
-#    base-url: https://pg.telpay.youcloudtech.com
-#    payment-page-base-url: https://pg.telpay.co.zw.youcloudtech.com/gateway-payments
-#    client-id: 1750499f-8c97-414d-bdb6-612ce555742f
-#    client-secret: fc2bf1b4-6855-459f-9e0c-a4de4219bd79
-#    merchant-name: Tinotenda
-#
-#feign:
-#  client:
-#    config:
-#      default:
-#        connectTimeout: 5000
-#        readTimeout: 5000
