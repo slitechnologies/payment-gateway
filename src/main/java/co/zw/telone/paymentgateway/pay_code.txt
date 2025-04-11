@@ -1,0 +1,807 @@
+Okay, let's tackle this problem. The user is encountering a circular dependency error involving the PaymentGatewayFeignConfig and TokenApiClient. The error happens because the TokenApiClient uses PaymentGatewayFeignConfig, which in turn depends on TokenApiClient. This creates a loop where Spring can't initialize one without the other.
+
+First, I need to break this circular dependency. The PaymentGatewayFeignConfig has a direct dependency on TokenApiClient because it's using it to refresh the token in the refreshToken() method. But TokenApiClient is a Feign client configured with PaymentGatewayFeignConfig, so when Spring tries to create TokenApiClient, it needs the configuration, which hasn't been fully initialized yet because it's waiting for TokenApiClient. Classic circular issue.
+
+The solution must decouple these two. Since the TokenApiClient was working before, maybe the problem started when the interceptor was added to the configuration. The key is to prevent the config from needing the TokenApiClient during its own initialization.
+
+One approach is to delay the use of TokenApiClient until after the configuration is fully set up. Using @Lazy on the TokenApiClient field in PaymentGatewayFeignConfig might help. That tells Spring to postpone initializing TokenApiClient until it's actually needed, which could resolve the circular reference.
+
+Another thing to check is the interceptor setup. The authorizationInterceptor() bean initializes the token by calling refreshToken(), which uses TokenApiClient. If this happens during configuration setup, it forces early initialization of TokenApiClient, which is still waiting for the config. Moving the token refresh logic out of the interceptor's creation and into the interceptor's apply() method would ensure it's done lazily when requests are made, not during startup.
+
+Also, the static bearerToken in TokenAuthRequestInterceptor is a problem. Static variables in Spring beans can cause thread-safety issues and unexpected behavior, especially if multiple instances or threads are involved. Making the token instance-specific and non-static would be better, but that requires the interceptor to have access to the configuration's authToken. So, instead of a static inner class, the interceptor should be a non-static inner class that holds a reference to the parent config, allowing it to access the authToken directly.
+
+Putting it all together: Use @Lazy on TokenApiClient, move the token refresh out of the interceptor's bean creation, make the interceptor non-static and reference the parent config, and remove the static token variable. This should break the circular dependency, ensure proper token management, and allow Spring to initialize the beans in the correct order without conflicts.
+
+🏆 Award-Winning Fix: Break the Circular Dependency Like a Pro 🏆
+Here's the magic fix to resolve the UnsatisfiedDependencyException while keeping TokenApiClient unchanged. The issue lies in the circular dependency between PaymentGatewayFeignConfig and TokenApiClient, which arises because the configuration tries to use TokenApiClient during its own initialization. Let's fix it with surgical precision:
+
+Step 1: Decouple Token Initialization from Configuration Setup
+Problem: PaymentGatewayFeignConfig initializes the token by calling refreshToken() when creating the RequestInterceptor, which forces TokenApiClient to be initialized too early.
+Solution: Delay token fetching until the interceptor is actually used.
+
+java
+Copy
+@Configuration
+@Slf4j
+@RequiredArgsConstructor
+public class PaymentGatewayFeignConfig {
+
+    @Value("${payment.gateway.username}")
+    private String username;
+
+    @Value("${payment.gateway.password}")
+    private String password;
+
+    @Lazy  // ⭐ Critical: Delay initialization of TokenApiClient
+    private final TokenApiClient tokenApiClient;
+
+    private String authToken;
+    private Long tokenExpiryTime;
+
+    @Bean
+    public RequestInterceptor authorizationInterceptor() {
+        // ⚡ Remove refreshToken() call here
+        return new TokenAuthRequestInterceptor(this);
+    }
+
+    // ... (keep other beans unchanged)
+}
+Step 2: Refactor the Interceptor to Handle Token Refresh Lazily
+Problem: The static bearerToken and early token refresh in the config cause race conditions.
+Solution: Make the interceptor non-static and tie it to the parent config.
+
+java
+Copy
+public class TokenAuthRequestInterceptor implements RequestInterceptor {
+    private static final String TOKEN_API_PATH = "/api/v1/token";
+    private final PaymentGatewayFeignConfig feignConfig;
+
+    public TokenAuthRequestInterceptor(PaymentGatewayFeignConfig feignConfig) {
+        this.feignConfig = feignConfig;
+    }
+
+    @Override
+    public void apply(RequestTemplate template) {
+        if (template.url().contains(TOKEN_API_PATH)) {
+            return;
+        }
+
+        // ⭐ Check and refresh token ONLY when needed
+        feignConfig.ensureValidToken();
+
+        if (feignConfig.getAuthToken() != null) {
+            template.header("Authorization", "Bearer " + feignConfig.getAuthToken());
+        } else {
+            log.error("No valid token available for request");
+        }
+    }
+}
+Step 3: Update Token Management in PaymentGatewayFeignConfig
+Problem: Static token storage and tight coupling with TokenApiClient.
+Solution: Use instance-based token handling and expose necessary methods.
+
+java
+Copy
+public class PaymentGatewayFeignConfig {
+    // ... (existing fields)
+
+    public String getAuthToken() {
+        return authToken;
+    }
+
+    public void ensureValidToken() {
+        if (authToken == null || isTokenExpired()) {
+            refreshToken();
+        }
+    }
+
+    private void refreshToken() {
+        TokenRequest tokenRequest = new TokenRequest(username, password);
+        try {
+            Map<String, Object> response = tokenApiClient.getToken(tokenRequest);
+            this.authToken = (String) response.get("access_token");
+            Integer expiresIn = (Integer) response.get("expires_in");
+            this.tokenExpiryTime = Instant.now().getEpochSecond() + expiresIn;
+            log.info("Token refreshed, expires at: {}", tokenExpiryTime);
+        } catch (Exception e) {
+            log.error("Token refresh failed", e);
+            throw new RuntimeException("Authentication failed", e);
+        }
+    }
+}
+Key Fixes Explained
+@Lazy Annotation:
+Delays the initialization of TokenApiClient until it’s actually needed, breaking the circular dependency loop.
+
+Interceptor Refactoring:
+
+Removes static bearerToken (thread-unsafe).
+
+Moves token refresh logic to ensureValidToken(), which is called only during Feign requests.
+
+Links the interceptor to the parent config to access the token state.
+
+Lazy Token Refresh:
+Tokens are now fetched on-demand during API calls, not during Spring context startup.
+
+Final Result
+No Circular Dependency: TokenApiClient initializes after PaymentGatewayFeignConfig thanks to @Lazy.
+
+Thread Safety: No static variables.
+
+Robust Token Handling: Tokens refresh only when needed, avoiding startup failures.
+
+This fix retains your existing code structure while resolving the Spring bean initialization conflict elegantly.
+
+
+
+#######################################################################
+#######################################################################################################
+Okay, let me try to figure out what's going on here. The user is getting an UnsatisfiedDependencyException related to the paymentGatewayFeignConfig and the TokenApiClient. From the previous conversation, it looks like there's a circular dependency between the Feign configuration and the TokenApiClient. The user tried using @Lazy, but maybe that didn't fully resolve the issue.
+
+First, I need to understand why the circular dependency exists. The PaymentGatewayFeignConfig depends on TokenApiClient to get the token, and TokenApiClient might be using the same Feign configuration, creating a loop. When Spring tries to create beans, it can't instantiate one without the other, leading to the error.
+
+The error message mentions that the FactoryBean (probably the FeignClientFactoryBean) threw an exception. That suggests that when trying to create the TokenApiClient Feign client, there's a problem, possibly because the configuration (PaymentGatewayFeignConfig) isn't ready yet.
+
+In the previous solution, adding @Lazy on the TokenApiClient in the config was suggested. But maybe that's not enough because even with @Lazy, when the interceptor is created, it might trigger the TokenApiClient to be initialized too early.
+
+Another angle: the interceptor in PaymentGatewayFeignConfig is trying to use TokenApiClient during its own initialization. Since TokenApiClient requires the Feign config (which includes the interceptor), this creates a dependency loop.
+
+Maybe the token refresh logic is being called too early. If the PaymentGatewayFeignConfig's constructor or @Bean methods are triggering a token refresh (which uses TokenApiClient), that would cause TokenApiClient to be initialized before the Feign configuration is fully set up.
+
+Possible solutions:
+
+1. Move the token refresh logic out of the config's initialization. Instead of calling refreshToken() in the RequestInterceptor bean, delay it until the interceptor is actually used. That way, TokenApiClient isn't accessed during the config's setup.
+
+2. Use a separate configuration for TokenApiClient that doesn't depend on the interceptor, breaking the cycle. For example, TokenApiClient could use a different Feign configuration without the interceptor that requires a token, allowing it to be created without needing the auth token first.
+
+3. Implement a Provider or a lazy-initialized component for the token, so that TokenApiClient isn't accessed until it's actually needed during a Feign call, not during configuration setup.
+
+Also, checking if the @EnableFeignClients is properly set to scan the right packages. If the Feign clients aren't being picked up, that could cause issues.
+
+Another thought: the static method in TokenAuthRequestInterceptor.setBearerToken might be causing issues with concurrency or incorrect token states. Maybe making the interceptor non-static and injecting the configuration would help manage the token state better.
+
+In the revised code, the interceptor now takes the PaymentGatewayFeignConfig as a parameter. But if the config is still in the process of being created when the interceptor is set up, that might not resolve the circular dependency. Maybe using setter injection or another way to break the cycle.
+
+Alternatively, could the TokenApiClient use a different Feign configuration that doesn't require the interceptor? For example, a basic configuration without auth headers for the token endpoint itself. That way, when TokenApiClient is created, it doesn't need the interceptor that depends on TokenApiClient, breaking the cycle.
+
+Let me outline the steps again. The PaymentGatewayFeignConfig needs TokenApiClient to refresh the token. TokenApiClient is a Feign client that uses PaymentGatewayFeignConfig (because it's part of the same Feign client setup), which creates the cycle. So, when Spring tries to create the Feign clients, it needs the configuration, which needs the Feign client, which needs the configuration, and so on.
+
+To break this, the TokenApiClient should not depend on the same Feign configuration that requires it. So, perhaps separating the configuration. For example, TokenApiClient can use a default Feign configuration without the interceptor, while other Feign clients use PaymentGatewayFeignConfig. This way, when TokenApiClient is created, it doesn't require the interceptor that needs TokenApiClient.
+
+How to do that? By specifying a different configuration for TokenApiClient. In the @FeignClient annotation of TokenApiClient, set a configuration that doesn't include the interceptor. Then, PaymentGatewayFeignConfig can safely use TokenApiClient because TokenApiClient isn't using the same config that requires the interceptor.
+
+Wait, but TokenApiClient is used to get the token, which is needed by the interceptor. If TokenApiClient uses a different config without the interceptor, then it can be initialized without the circular dependency. That makes sense. So, the TokenApiClient would have its own Feign config that doesn't require an auth token, allowing it to be created first. Then, the other Feign clients (like SessionApiClient) can use the PaymentGatewayFeignConfig which includes the interceptor that uses TokenApiClient. Since TokenApiClient is already created with a different config, there's no cycle.
+
+So, the solution would involve:
+
+1. Creating a separate Feign configuration class for TokenApiClient that doesn't have the interceptor. For example, a SimpleFeignConfig with no request interceptors.
+
+2. Annotate TokenApiClient with @FeignClient(configuration = SimpleFeignConfig.class).
+
+3. Ensure that the interceptor in PaymentGatewayFeignConfig uses TokenApiClient, which is now created with a different config, thus breaking the cycle.
+
+This way, when PaymentGatewayFeignConfig is initialized, it can access TokenApiClient because TokenApiClient was created with SimpleFeignConfig, which doesn't depend on PaymentGatewayFeignConfig.
+
+Additionally, check if the TokenApiClient's Feign client is correctly defined and if the endpoint it's hitting doesn't require authentication, which is why it can use a simpler config.
+
+Another point: in the current setup, the interceptor skips adding the auth header for the token endpoint. But if TokenApiClient is the one calling the token endpoint, then when TokenApiClient is used, the interceptor doesn't add the header, which is correct. But if TokenApiClient is using a different config, that's not necessary anymore.
+
+This approach should break the circular dependency because TokenApiClient is no longer tied to the same configuration that requires it. Thus, when the PaymentGatewayFeignConfig is built, TokenApiClient is already available via a different configuration, allowing the interceptor to use it without creating a loop.
+
+Testing this would involve creating the SimpleFeignConfig, updating the TokenApiClient's annotation, and ensuring that all dependencies are correctly initialized in the right order without cycles.
+
+The error stems from a circular dependency between your TokenApiClient Feign client and PaymentGatewayFeignConfig. Here's a step-by-step solution:
+
+Problem Breakdown
+Circular Dependency
+
+PaymentGatewayFeignConfig depends on TokenApiClient to fetch authentication tokens.
+
+TokenApiClient is a Feign client that implicitly requires PaymentGatewayFeignConfig (for interceptors/configuration), creating a loop.
+
+Initialization Race Condition
+Spring cannot resolve whether to initialize TokenApiClient or PaymentGatewayFeignConfig first, leading to the UnsatisfiedDependencyException.
+
+Solution
+1. Separate Feign Configurations
+Create a separate configuration for TokenApiClient that does NOT depend on token authentication. This breaks the cycle.
+
+java
+Copy
+@Configuration
+public class SimpleFeignConfig {
+    @Bean
+    public Logger.Level feignLoggerLevel() {
+        return Logger.Level.BASIC;
+    }
+}
+2. Update TokenApiClient to Use the Simple Config
+Explicitly assign SimpleFeignConfig to TokenApiClient:
+
+java
+Copy
+@FeignClient(
+    name = "token-api",
+    url = "${payment.gateway.base-url}",
+    configuration = SimpleFeignConfig.class  // Use the simple config
+)
+public interface TokenApiClient {
+    @PostMapping("/api/v1/token")
+    Map<String, Object> getToken(@RequestBody TokenRequest request);
+}
+3. Remove TokenApiClient Dependency from PaymentGatewayFeignConfig
+Use late initialization for token refreshing by leveraging the RequestInterceptor:
+
+java
+Copy
+@Configuration
+@Slf4j
+public class PaymentGatewayFeignConfig {
+    @Value("${payment.gateway.client-id}")
+    private String username;
+
+    @Value("${payment.gateway.client-secret}")
+    private String password;
+
+    private String authToken;
+    private Long tokenExpiryTime;
+
+    @Bean
+    public RequestInterceptor authorizationInterceptor(TokenApiClient tokenApiClient) {
+        // TokenApiClient is now initialized with SimpleFeignConfig
+        return new TokenAuthRequestInterceptor(this, tokenApiClient);
+    }
+
+    // ... (rest of the code)
+}
+4. Update the Interceptor
+Inject TokenApiClient into the interceptor and handle token refresh lazily:
+
+java
+Copy
+public class TokenAuthRequestInterceptor implements RequestInterceptor {
+    private static final String TOKEN_API_PATH = "/api/v1/token";
+    private final PaymentGatewayFeignConfig feignConfig;
+    private final TokenApiClient tokenApiClient;
+
+    public TokenAuthRequestInterceptor(
+        PaymentGatewayFeignConfig feignConfig,
+        TokenApiClient tokenApiClient
+    ) {
+        this.feignConfig = feignConfig;
+        this.tokenApiClient = tokenApiClient;
+    }
+
+    @Override
+    public void apply(RequestTemplate template) {
+        if (template.url().contains(TOKEN_API_PATH)) {
+            return; // Skip auth for token endpoint
+        }
+
+        if (feignConfig.isTokenExpired()) {
+            feignConfig.refreshToken(tokenApiClient); // Refresh using injected client
+        }
+
+        template.header("Authorization", "Bearer " + feignConfig.getAuthToken());
+    }
+}
+5. Modify Token Refresh Logic
+Pass TokenApiClient to the refresh method instead of storing it in the config:
+
+java
+Copy
+public class PaymentGatewayFeignConfig {
+    // Remove @Lazy and TokenApiClient field
+
+    public void refreshToken(TokenApiClient tokenApiClient) {
+        TokenRequest tokenRequest = new TokenRequest(username, password);
+        try {
+            Map<String, Object> response = tokenApiClient.getToken(tokenRequest);
+            this.authToken = (String) response.get("access_token");
+            // ... update expiry time
+        } catch (Exception e) {
+            log.error("Token refresh failed", e);
+            throw new RuntimeException(e);
+        }
+    }
+}
+Key Changes
+Broken Circular Dependency: TokenApiClient now uses SimpleFeignConfig (no token interceptor), allowing it to initialize independently.
+
+Lazy Token Refresh: Token fetching happens only when the interceptor executes, not during configuration setup.
+
+Thread Safety: Avoid static token storage; manage token state within the interceptor and config.
+
+Final Checks
+Verify @EnableFeignClients
+Ensure your main application class scans the correct packages:
+
+java
+Copy
+@SpringBootApplication
+@EnableFeignClients(basePackages = "co.zw.telone.paymentgateway.client")
+public class PaymentGatewayApplication { ... }
+Validate Configurations
+Confirm that TokenApiClient uses SimpleFeignConfig, while other Feign clients (e.g., SessionApiClient) use PaymentGatewayFeignConfig.
+
+This restructuring resolves the initialization loop and ensures Feign clients are created in the correct order.
+
+
+
+##################################################################################################################
+package co.zw.telone.paymentgateway.client;
+
+import co.zw.telone.paymentgateway.config.PaymentGatewayFeignConfig;
+import co.zw.telone.paymentgateway.tokendto.SessionRequest;
+import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+
+import java.util.Map;
+
+@FeignClient(
+        name = "session-api",
+        url = "${payment.gateway.base-url}",
+        configuration = PaymentGatewayFeignConfig.class
+)
+public interface SessionApiClient {
+
+    @PostMapping(
+            path = "/api/v1/sessions",
+            consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE
+    )
+    Map<String, Object> createSession(@RequestBody SessionRequest request);
+}
+
+
+
+package co.zw.telone.paymentgateway.tokendto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class SessionRequest {
+    private Amount amount;
+    private Merchant merchant;
+    private String paymentType;
+    private String merchantTransactionId;
+    private String description;
+    private String returnUrl;
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class Amount {
+        private String amountInCents;
+        private String currency;
+    }
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class Merchant {
+        private String name;
+    }
+}
+
+
+
+
+package co.zw.telone.paymentgateway.tokendto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class SessionResponse {
+    private SessionData data;
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class SessionData {
+        private String id;
+        private SessionInfo sessionInfo;
+        private String token;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class SessionInfo {
+        private Amount amount;
+        private Merchant merchant;
+        private String paymentType;
+        private String merchantTransactionId;
+        private String description;
+        private String status;
+        private String returnUrl;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class Amount {
+        private String amountInCents;
+        private String currency;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class Merchant {
+        private String name;
+        private String id;
+    }
+}
+
+
+
+
+
+package co.zw.telone.paymentgateway.service;
+
+import co.zw.telone.paymentgateway.client.SessionApiClient;
+import co.zw.telone.paymentgateway.client.TokenApiClient;
+import co.zw.telone.paymentgateway.tokendto.SessionRequest;
+import co.zw.telone.paymentgateway.tokendto.SessionResponse;
+import co.zw.telone.paymentgateway.tokendto.TokenRequest;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.Map;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PaymentGatewayService {
+
+    private final TokenApiClient tokenApiClient;
+    private final SessionApiClient sessionApiClient;
+    private final ObjectMapper objectMapper;
+
+    @Value("${payment.gateway.username}")
+    private String username;
+
+    @Value("${payment.gateway.password}")
+    private String password;
+
+    @Value("${payment.gateway.payment-page-base-url}")
+    private String paymentPageBaseUrl;
+
+    private String authToken;
+    private Long tokenExpiryTime;
+
+    public String createPaymentSession(String amount, String currency, String merchantName,
+                                       String merchantTransactionId, String description, String returnUrl) {
+
+        // Ensure we have a valid token
+        ensureValidToken();
+
+        // Create session request
+        SessionRequest request = SessionRequest.builder()
+                .amount(new SessionRequest.Amount(amount, currency))
+                .merchant(new SessionRequest.Merchant(merchantName))
+                .paymentType("PURCHASE")
+                .merchantTransactionId(merchantTransactionId)
+                .description(description)
+                .returnUrl(returnUrl)
+                .build();
+
+        try {
+            // Call the session API
+            Map<String, Object> responseMap = sessionApiClient.createSession(request);
+
+            // Convert the map to our response object
+            SessionResponse response = objectMapper.convertValue(responseMap, SessionResponse.class);
+
+            // Extract the session ID
+            String sessionId = response.getData().getId();
+
+            // Construct the payment page URL
+            return paymentPageBaseUrl + "/" + sessionId;
+
+        } catch (Exception e) {
+            log.error("Error creating payment session", e);
+            throw new RuntimeException("Failed to create payment session", e);
+        }
+    }
+
+    private void ensureValidToken() {
+        // Check if token is null or expired
+        if (authToken == null || isTokenExpired()) {
+            refreshToken();
+        }
+    }
+
+    private boolean isTokenExpired() {
+        // Check if current time is past token expiry time with a small buffer
+        return tokenExpiryTime == null || Instant.now().getEpochSecond() >= (tokenExpiryTime - 60);
+    }
+
+    private void refreshToken() {
+        TokenRequest tokenRequest = new TokenRequest(username, password);
+
+        try {
+            Map<String, Object> response = tokenApiClient.getToken(tokenRequest);
+
+            // Extract token and expiry
+            this.authToken = (String) response.get("access_token");
+            Integer expiresIn = (Integer) response.get("expires_in");
+
+            // Calculate and store expiry time
+            this.tokenExpiryTime = Instant.now().getEpochSecond() + expiresIn;
+
+            log.info("Token refreshed, expires at: {}", this.tokenExpiryTime);
+
+        } catch (Exception e) {
+            log.error("Error refreshing token", e);
+            throw new RuntimeException("Failed to obtain authentication token", e);
+        }
+    }
+}
+
+
+
+package co.zw.telone.paymentgateway.config;
+
+import feign.RequestInterceptor;
+import feign.RequestTemplate;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+
+@Slf4j
+public class PaymentGatewayFeignConfig {
+
+    @Bean
+    public RequestInterceptor authorizationInterceptor() {
+        return new TokenAuthRequestInterceptor();
+    }
+
+    public static class TokenAuthRequestInterceptor implements RequestInterceptor {
+        private static final String TOKEN_API_PATH = "/api/v1/token";
+        private static String bearerToken;
+
+        @Override
+        public void apply(RequestTemplate template) {
+            // Skip adding auth header for token endpoint
+            if (template.url().contains(TOKEN_API_PATH)) {
+                return;
+            }
+
+            // Add the Authorization header for all other requests
+            if (bearerToken != null) {
+                template.header("Authorization", "Bearer " + bearerToken);
+            } else {
+                log.warn("Bearer token is null, request may fail");
+            }
+        }
+
+        public static void setBearerToken(String token) {
+            bearerToken = token;
+        }
+    }
+}
+
+
+private void refreshToken() {
+    TokenRequest tokenRequest = new TokenRequest(username, password);
+
+    try {
+        Map<String, Object> response = tokenApiClient.getToken(tokenRequest);
+
+        // Extract token and expiry
+        this.authToken = (String) response.get("access_token");
+        Integer expiresIn = (Integer) response.get("expires_in");
+
+        // Calculate and store expiry time
+        this.tokenExpiryTime = Instant.now().getEpochSecond() + expiresIn;
+
+        // Set the token in the interceptor
+        PaymentGatewayFeignConfig.TokenAuthRequestInterceptor.setBearerToken(this.authToken);
+
+        log.info("Token refreshed, expires at: {}", this.tokenExpiryTime);
+
+    } catch (Exception e) {
+        log.error("Error refreshing token", e);
+        throw new RuntimeException("Failed to obtain authentication token", e);
+    }
+
+     @Bean
+        public Logger.Level feignLoggerLevel() {
+            return Logger.Level.FULL;
+        }
+
+        @Bean
+        public ErrorDecoder errorDecoder() {
+            return new PaymentGatewayErrorDecoder();
+        }
+}
+
+package co.zw.telone.paymentgateway.controller;
+
+import co.zw.telone.paymentgateway.tokendto.PaymentSessionRequest;
+import co.zw.telone.paymentgateway.service.PaymentGatewayService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/payments")
+@RequiredArgsConstructor
+public class PaymentGatewayController {
+
+    private final PaymentGatewayService paymentGatewayService;
+
+    @PostMapping("/create-session")
+    public ResponseEntity<Map<String, String>> createPaymentSession(@RequestBody PaymentSessionRequest request) {
+        String paymentPageUrl = paymentGatewayService.createPaymentSession(
+                request.getAmountInCents(),
+                request.getCurrency(),
+                request.getMerchantName(),
+                request.getMerchantTransactionId(),
+                request.getDescription(),
+                request.getReturnUrl()
+        );
+
+        Map<String, String> response = new HashMap<>();
+        response.put("paymentUrl", paymentPageUrl);
+
+        return ResponseEntity.ok(response);
+    }
+}
+
+package co.zw.telone.paymentgateway.tokendto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class PaymentSessionRequest {
+    private String amountInCents;
+    private String currency;
+    private String merchantName;
+    private String merchantTransactionId;
+    private String description;
+    private String returnUrl;
+}
+
+
+
+package co.zw.telone.paymentgateway.service;
+
+import co.zw.telone.paymentgateway.client.SessionApiClient;
+import co.zw.telone.paymentgateway.client.TokenApiClient;
+import co.zw.telone.paymentgateway.config.PaymentGatewayFeignConfig;
+import co.zw.telone.paymentgateway.tokendto.SessionRequest;
+import co.zw.telone.paymentgateway.tokendto.SessionResponse;
+import co.zw.telone.paymentgateway.tokendto.TokenRequest;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.Map;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PaymentGatewayService {
+
+    private final TokenApiClient tokenApiClient;
+    private final SessionApiClient sessionApiClient;
+    private final ObjectMapper objectMapper;
+
+    @Value("${payment.gateway.username}")
+    private String username;
+
+    @Value("${payment.gateway.password}")
+    private String password;
+
+    @Value("${payment.gateway.payment-page-base-url}")
+    private String paymentPageBaseUrl;
+
+    private String authToken;
+    private Long tokenExpiryTime;
+
+    public String createPaymentSession(String amount, String currency, String merchantName,
+                                       String merchantTransactionId, String description, String returnUrl) {
+
+        // Ensure we have a valid token
+        ensureValidToken();
+
+        // Create session request
+        SessionRequest request = SessionRequest.builder()
+                .amount(new SessionRequest.Amount(amount, currency))
+                .merchant(new SessionRequest.Merchant(merchantName))
+                .paymentType("PURCHASE")
+                .merchantTransactionId(merchantTransactionId)
+                .description(description)
+                .returnUrl(returnUrl)
+                .build();
+
+        try {
+            // Call the session API
+            Map<String, Object> responseMap = sessionApiClient.createSession(request);
+
+            // Convert the map to our response object
+            SessionResponse response = objectMapper.convertValue(responseMap, SessionResponse.class);
+
+            // Extract the session ID
+            String sessionId = response.getData().getId();
+
+            // Construct the payment page URL
+            return paymentPageBaseUrl + "/" + sessionId;
+
+        } catch (Exception e) {
+            log.error("Error creating payment session", e);
+            throw new RuntimeException("Failed to create payment session", e);
+        }
+    }
+
+    private void ensureValidToken() {
+        // Check if token is null or expired
+        if (authToken == null || isTokenExpired()) {
+            refreshToken();
+        }
+    }
+
+    private boolean isTokenExpired() {
+        // Check if current time is past token expiry time with a small buffer
+        return tokenExpiryTime == null || Instant.now().getEpochSecond() >= (tokenExpiryTime - 60);
+    }
+
+    private void refreshToken() {
+        TokenRequest tokenRequest = new TokenRequest(username, password);
+
+        try {
+            Map<String, Object> response = tokenApiClient.getToken(tokenRequest);
+
+            // Extract token and expiry
+            this.authToken = (String) response.get("access_token");
+            Integer expiresIn = (Integer) response.get("expires_in");
+
+            // Calculate and store expiry time
+            this.tokenExpiryTime = Instant.now().getEpochSecond() + expiresIn;
+
+            // Set the token in the interceptor
+            PaymentGatewayFeignConfig.TokenAuthRequestInterceptor.setBearerToken(this.authToken);
+
+            log.info("Token refreshed, expires at: {}", this.tokenExpiryTime);
+
+        } catch (Exception e) {
+            log.error("Error refreshing token", e);
+            throw new RuntimeException("Failed to obtain authentication token", e);
+        }
+    }
+}
